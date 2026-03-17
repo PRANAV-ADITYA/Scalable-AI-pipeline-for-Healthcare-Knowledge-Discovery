@@ -18,12 +18,12 @@ API_KEY = "REMOVED"
 genai.configure(api_key=API_KEY)
 
 # ── Database Configuration ───────────────────────────────────
-PG_HOST     = "medai-postgres-server.postgres.database.azure.com"
+PG_HOST     = "localhost"
 PG_PORT     = "5432"
 PG_USER     = "medai"
-PG_PASSWORD = "MedAI%40123456"
+PG_PASSWORD = "medai123"
 PG_DB       = "medical_insights"
-PG_URL      = f"postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DB}?sslmode=require"
+PG_URL      = f"postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DB}"
 
 TABLE_NAME  = "validated_summaries"
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
