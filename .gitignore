@@ -1,3 +1,9 @@
 node_modules/
 medical_insights.db
+.envdeployment.zip
+*.zip
 .env
+embeddings.faiss
+embeddings_meta.pkl
+bertopic_model/
+medical_insights.db
