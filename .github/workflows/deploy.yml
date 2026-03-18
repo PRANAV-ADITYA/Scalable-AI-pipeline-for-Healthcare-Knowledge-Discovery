@@ -24,17 +24,35 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Create .env file
+      - name: Create zip package
         run: |
-          echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
-          echo "PG_HOST=medai-postgres-server.postgres.database.azure.com" >> .env
-          echo "PG_USER=medai" >> .env
-          echo "PG_PASSWORD=${{ secrets.PG_PASSWORD }}" >> .env
-          echo "PG_DB=medical_insights" >> .env
+          zip -r app.zip Ai_pipeline_backend.py requirements.txt startup.txt
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Deploy to Azure Web App
-        uses: azure/webapps-deploy@v3
-        with:
-          app-name: medai-backend
-          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
-          package: .
+        run: |
+          az webapp config appsettings set \
+            --resource-group medai-rg \
+            --name medai-backend \
+            --settings \
+              GEMINI_API_KEY="${{ secrets.GEMINI_API_KEY }}" \
+              PG_HOST="medai-postgres-server.postgres.database.azure.com" \
+              PG_USER="medai" \
+              PG_PASSWORD="${{ secrets.PG_PASSWORD }}" \
+              PG_DB="medical_insights" \
+              SCM_DO_BUILD_DURING_DEPLOYMENT=true
+
+          az webapp deploy \
+            --resource-group medai-rg \
+            --name medai-backend \
+            --src-path app.zip \
+            --type zip
+
+          az webapp config set \
+            --resource-group medai-rg \
+            --name medai-backend \
+            --startup-file "gunicorn --bind 0.0.0.0:8000 --timeout 120 --workers 2 Ai_pipeline_backend:app"
