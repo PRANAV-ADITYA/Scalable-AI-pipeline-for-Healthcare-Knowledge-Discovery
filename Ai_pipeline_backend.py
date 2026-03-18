@@ -15,7 +15,7 @@ from sqlalchemy import create_engine, text
 import google.generativeai as genai
 
 # ── Gemini Configuration ─────────────────────────────────────
-API_KEY = os.environ.get("GEMINI_API_KEY", "REMOVED")
+API_KEY = os.environ.get("GEMINI_API_KEY", "")
 genai.configure(api_key=API_KEY)
 
 # ── Database Configuration ───────────────────────────────────
