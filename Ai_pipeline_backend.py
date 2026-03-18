@@ -2,10 +2,8 @@
 # MedAI Knowledge Discovery — Flask RAG Backend (Cloud Final)
 # DB  : Azure PostgreSQL + pgvector (HNSW index)
 # LLM : Google Gemini 2.5 Flash
-# Embed: TF-IDF based retrieval (no heavy ML model needed)
-#        Falls back to pgvector full-text search
-#        Zero heavy dependencies — fits in 512MB RAM
-#        Scales to millions of docs via PostgreSQL
+# Retrieval: PostgreSQL FTS (GIN index) — scales to millions
+# RAM: ~200MB — fits Azure free tier
 # ============================================================
 
 import os
@@ -21,17 +19,18 @@ API_KEY = os.environ.get("GEMINI_API_KEY", "REMOVED")
 genai.configure(api_key=API_KEY)
 
 # ── Database Configuration ───────────────────────────────────
-# Local  : points to Azure PostgreSQL (same as cloud)
-# Cloud  : reads from environment variables set in App Service
-PG_HOST     = os.environ.get("PG_HOST",     "medai-postgres-server.postgres.database.azure.com")
-PG_PORT     = "5432"
-PG_USER     = os.environ.get("PG_USER",     "medai")
-PG_PASSWORD = os.environ.get("PG_PASSWORD", "MedAI%40123456")
-PG_DB       = os.environ.get("PG_DB",       "medical_insights")
-PG_URL      = f"postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DB}?sslmode=require"
+# Single URL env var avoids @ encoding issues completely
+# ── Database Configuration ───────────────────────────────────
+from urllib.parse import quote_plus
 
-TABLE_NAME  = "validated_summaries"
-TOP_K       = 8
+PG_HOST = os.environ.get("PG_HOST", "medai-postgres-server.postgres.database.azure.com")
+PG_USER = os.environ.get("PG_USER", "medai")
+PG_PASS = os.environ.get("PG_PASS", "MedAI@123456")
+PG_DB   = os.environ.get("PG_DB",   "medical_insights")
+PG_URL  = f"postgresql://{PG_USER}:{quote_plus(PG_PASS)}@{PG_HOST}:5432/{PG_DB}?sslmode=require"
+
+TABLE_NAME = "validated_summaries"
+TOP_K      = 8
 
 app    = Flask(__name__)
 CORS(app)
@@ -39,7 +38,7 @@ engine = create_engine(
     PG_URL,
     pool_size=5,
     max_overflow=10,
-    pool_pre_ping=True    # auto-reconnect if connection drops
+    pool_pre_ping=True
 )
 
 def verify_db():
@@ -51,25 +50,15 @@ def verify_db():
     except Exception as e:
         print(f"  WARNING: DB connection failed: {e}")
 
-verify_db()
+try:
+    verify_db()
+except Exception:
+    print("  DB check failed at startup — will retry on first request")
 
 # ============================================================
-# RETRIEVAL — Pure PostgreSQL, no ML model needed
-#
-# Strategy: Two-stage retrieval
-# Stage 1: PostgreSQL full-text search (fast, scales to millions)
-#          Uses GIN index on tsvector — sub-second at any scale
-# Stage 2: Re-rank by ROUGE score + topic boost
-#
-# Why this scales to millions:
-# - Full-text search uses PostgreSQL's built-in GIN index
-# - No Python ML model running in memory
-# - All computation inside the database engine
-# - Add more Postgres replicas = linear scale
+# FULL-TEXT SEARCH INDEX
 # ============================================================
-
 def ensure_fts_index():
-    """Create full-text search index if not exists."""
     try:
         with engine.connect() as conn:
             conn.execute(text(f"""
@@ -81,29 +70,27 @@ def ensure_fts_index():
     except Exception:
         pass
 
-ensure_fts_index()
+try:
+    ensure_fts_index()
+except Exception:
+    pass
 
-
+# ============================================================
+# RETRIEVAL — PostgreSQL FTS (GIN index)
+# Scales to millions of docs — no ML model needed in serving
+# ============================================================
 def get_context(query: str, topic_hint: str = None) -> str:
-    """
-    Two-stage retrieval:
-    1. PostgreSQL full-text search (GIN index — scales to millions)
-    2. Re-rank by ROUGE score + topic boost
-    """
     try:
-        # Clean query for full-text search
         clean_query = re.sub(r'[^a-zA-Z0-9\s]', '', query)
-        # Convert to tsquery format: "smoking & children"
         ts_query = " & ".join([
             w for w in clean_query.lower().split()
             if len(w) > 2
         ])
 
         with engine.connect() as conn:
-
             results = []
 
-            # Stage 1a: Full-text search using GIN index
+            # Stage 1: Full-text search using GIN index
             if ts_query:
                 rows = conn.execute(text(f"""
                     SELECT
@@ -122,11 +109,11 @@ def get_context(query: str, topic_hint: str = None) -> str:
                 """), {"tsq": ts_query, "k": TOP_K * 2}).fetchall()
                 results = list(rows)
 
-            # Stage 1b: Fallback — LIKE search if FTS returns nothing
+            # Stage 2: LIKE fallback
             if len(results) < 4:
                 keywords = [w for w in clean_query.lower().split() if len(w) > 3]
                 if keywords:
-                    search_clause = " OR ".join([f"summary ILIKE :{f'kw{i}'}" for i in range(len(keywords))])
+                    search_clause = " OR ".join([f"summary ILIKE :kw{i}" for i in range(len(keywords))])
                     params = {f"kw{i}": f"%{kw}%" for i, kw in enumerate(keywords)}
                     params["k"] = TOP_K * 2
                     fallback = conn.execute(text(f"""
@@ -137,13 +124,12 @@ def get_context(query: str, topic_hint: str = None) -> str:
                         ORDER BY rouge_score DESC
                         LIMIT :k
                     """), params).fetchall()
-                    # Merge without duplicates
                     existing_ids = {r.abstract_id for r in results}
                     for row in fallback:
                         if row.abstract_id not in existing_ids:
                             results.append(row)
 
-            # Stage 1c: Safety fallback — top ROUGE records
+            # Stage 3: Safety fallback
             if len(results) < 4:
                 safety = conn.execute(text(f"""
                     SELECT abstract_id, summary, rouge_score, topic_label,
@@ -157,7 +143,7 @@ def get_context(query: str, topic_hint: str = None) -> str:
                     if row.abstract_id not in existing_ids:
                         results.append(row)
 
-            # Stage 2: Re-rank — topic boost + ROUGE score
+            # Re-rank: topic boost + ROUGE score
             results = sorted(
                 results,
                 key=lambda r: (
@@ -225,6 +211,11 @@ def detect_topic(query: str):
 # API ENDPOINTS
 # ============================================================
 
+@app.route('/api/health', methods=['GET'])
+def health():
+    return jsonify({"status": "healthy", "service": "MedAI Backend"})
+
+
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
     try:
@@ -248,7 +239,7 @@ def get_stats():
             "pgvector":   vec_count,
             "topics":     {r.topic_label: r.cnt for r in topics},
             "db_backend": "Azure PostgreSQL + pgvector",
-            "retrieval":  "PostgreSQL FTS (GIN index) — scales to millions",
+            "retrieval":  "PostgreSQL FTS (GIN) — scales to millions",
             "llm":        "Gemini 2.5 Flash"
         })
     except Exception as e:
@@ -320,14 +311,9 @@ def get_topics():
 
 @app.route('/api/search', methods=['POST'])
 def semantic_search():
-    """
-    Full-text search endpoint — shows reviewer what
-    PostgreSQL FTS is retrieving for any query.
-    Scales to millions via GIN index.
-    """
-    data   = request.json
-    query  = data.get("query", "")
-    top_k  = data.get("top_k", 5)
+    data       = request.json
+    query      = data.get("query", "")
+    top_k      = data.get("top_k", 5)
     topic_hint = detect_topic(query)
 
     clean_query = re.sub(r'[^a-zA-Z0-9\s]', '', query)
@@ -373,11 +359,6 @@ def semantic_search():
         return jsonify({"error": str(e)})
 
 
-@app.route('/api/health', methods=['GET'])
-def health():
-    return jsonify({"status": "healthy", "service": "MedAI Backend"})
-
-
 if __name__ == '__main__':
     print("\n" + "="*60)
     print("  MedAI Knowledge Discovery — Backend (Cloud Final)")
@@ -385,7 +366,5 @@ if __name__ == '__main__':
     print("  Retrieval: PostgreSQL FTS (GIN) — no ML model needed")
     print("  LLM      : Gemini 2.5 Flash")
     print("  RAM      : ~200MB — fits Azure free tier")
-    print("  Scale    : Millions of docs via PostgreSQL indexes")
     print("="*60)
-    print(f"  Starting Flask on http://0.0.0.0:5000\n")
     app.run(host='0.0.0.0', port=5000, debug=True)
