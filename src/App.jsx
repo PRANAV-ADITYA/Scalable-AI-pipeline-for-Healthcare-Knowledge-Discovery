@@ -12,7 +12,7 @@ import {
   FlaskConical,
 } from "lucide-react";
 
-const BACKEND_URL = "http://localhost:5000";
+const BACKEND_URL = "https://medai-backend.azurewebsites.net";
 
 // A lightweight helper to format the AI's "clumsy" text into clean HTML
 const FormattedText = ({ text }) => {
